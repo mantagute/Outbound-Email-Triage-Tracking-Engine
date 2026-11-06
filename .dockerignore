@@ -1,0 +1,28 @@
+# Virtual environments & caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Git & Docs
+.git/
+.github/
+docs/
+README.md
+LICENSE
+
+# Secrets & Local Env
+.env
+.env.*
+token.json
+credentials.json
+service_account.json
+*.pem
+*.key

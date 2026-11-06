@@ -162,21 +162,24 @@ Para garantir baixo acoplamento e alta testabilidade dentro de uma única unidad
 
 ```text
 outbound-email-tracker/
-├── .github/workflows/          # Definição do runner serverless (GitHub Actions)
+├── .github/workflows/             # Definição do runner serverless (GitHub Actions)
 ├── docs/
-│   └── ARCHITECTURE.md         # RFC-0001: Especificação arquitetural e decisões de projeto
+│   └── ARCHITECTURE.md            # RFC-0001: Especificação arquitetural e decisões de projeto
 ├── src/
-│   ├── config.py               # Carregamento e validação estrita de variáveis de ambiente
-│   ├── domain/                 # NÚCLEO DE DOMÍNIO (Zero dependências externas de rede/I/O)
-│   │   ├── models.py           # Entidades, taxonomias (Enums) e contratos de saída Pydantic
-│   │   └── stage1_rules.py     # Motor determinístico de avaliação RFC 5322 e códigos SMTP
-│   ├── adapters/               # ADAPTADORES DE INFRAESTRUTURA (Comunicação com APIs externas)
-│   │   ├── gmail_adapter.py    # Autenticação OAuth2, busca de threads e parsing MIME
-│   │   ├── gemini_adapter.py   # Cliente do Estágio 2 (Gemini 2.5 Flash + Structured Outputs)
-│   │   └── sheets_adapter.py   # Leitura de cursores e escrita parcial em lote (batch_update)
-│   └── pipeline/               # CAMADA DE APLICAÇÃO (Orquestração de Casos de Uso)
-│       └── sync_service.py     # Coordena Delta Sync -> Estágio 1 -> Estágio 2 -> Persistência
-└── tests/                      # Suíte de testes unitários isolados por camada
+│   ├── config.py                  # Carregamento e validação estrita de variáveis de ambiente
+│   ├── domain/                    # NÚCLEO DE DOMÍNIO (Zero dependências externas de rede/I/O)
+│   │   ├── enums.py               # Taxonomias (ThreadStatus, ReplyIntent) e Matriz de Transição
+│   │   ├── entities.py            # Entidades ricas (EmailThread, EmailMessage, TriageDecision)
+│   │   ├── exceptions.py          # Exceções de invariantes de negócio e violação de contrato
+│   │   ├── ports.py               # Contratos abstratos (Interfaces) exigidos dos adaptadores
+│   │   └── protocol_inspector.py  # ProtocolTriageInspector (inspeção RFC 5322, DSN e SMTP)
+│   ├── adapters/                  # ADAPTADORES DE INFRAESTRUTURA (Implementação das Ports)
+│   │   ├── gmail_adapter.py       # Autenticação OAuth2, busca de threads e parsing MIME
+│   │   ├── gemini_adapter.py      # Classificador Semântico (Gemini 2.5 Flash)
+│   │   └── sheets_adapter.py      # Leitura de cursores e escrita parcial em lote (batch_update)
+│   └── pipeline/                  # CAMADA DE APLICAÇÃO (Orquestração de Casos de Uso)
+│       └── sync_service.py        # Coordena Delta Sync -> Protocol Inspector -> Semantic -> Sheets
+└── tests/                         # Suíte de testes unitários isolados por camada
 ```
 
 ### 6.2. Garantia de Qualidade (Testes Offline)

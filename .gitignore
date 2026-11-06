@@ -1,0 +1,34 @@
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# Tooling & Testing
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Secrets & Credentials (Never commit)
+.env
+.env.*
+!.env.example
+token.json
+credentials.json
+service_account.json
+*.pem
+*.key
+
+# OS & Editor
+.DS_Store
+.vscode/
+.idea/
