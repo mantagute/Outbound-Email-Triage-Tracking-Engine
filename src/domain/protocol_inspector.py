@@ -1,8 +1,7 @@
-"""
-RFC 5322 & SMTP Protocol Triage Inspector (RFC-0001 Section 3.3).
+"""Inspetor determinístico de protocolo de e-mail (RFC 5322, RFC 3464 e códigos SMTP).
 
-Encapsulates deterministic header inspection, DSN (Delivery Status Notification) detection,
-and SMTP error severity analysis in a pure, dependency-free domain service.
+Resolve dentro de casa tudo que não precisa de IA: se o e-mail voltou com erro do servidor
+(Bounce 5xx ou 4xx) ou se ninguém de fora respondeu ainda (SEM_RESPOSTA).
 """
 
 import re
@@ -17,12 +16,7 @@ from src.domain.enums import ReplyIntent, ThreadStatus
 
 
 class ProtocolTriageInspector:
-    """
-    Domain service that inspects email protocol metadata (RFC 5322 / RFC 3464 / SMTP).
-
-    Resolves technical bounces (`INVALIDO_BOUNCE`) and unanswered threads (`SEM_RESPOSTA`)
-    deterministically before any semantic LLM inference is considered.
-    """
+    """Inspeciona cabeçalhos de protocolo antes de considerar qualquer chamada externa."""
 
     BOUNCE_SENDER_IDENTIFIERS: tuple[str, ...] = (
         "mailer-daemon",
@@ -45,6 +39,7 @@ class ProtocolTriageInspector:
     SMTP_4XX_REGEX = re.compile(r"\b(?:4\d{2}|4\.\d+\.\d+)\b")
 
     def __init__(self, outbound_account_email: str) -> None:
+        """Guarda o e-mail normalizado da conta de disparo para diferenciar quem é de casa."""
         normalized = normalize_email_address(outbound_account_email)
         if not normalized or "@" not in normalized:
             raise ValueError(
@@ -54,16 +49,14 @@ class ProtocolTriageInspector:
 
     @property
     def outbound_email(self) -> str:
-        """Normalized email address of the monitored outbound account."""
+        """Endereço de e-mail normalizado da conta monitorada."""
         return self._outbound_email
 
     def inspect(self, thread: EmailThread) -> TriageDecision | None:
-        """
-        Inspect an EmailThread and return a deterministic TriageDecision if applicable.
+        """Avalia se a conversa se resolve por regra de protocolo.
 
-        Returns:
-            - `TriageDecision` when the thread is a technical bounce or has no external reply.
-            - `None` when the thread contains third-party messages requiring semantic analysis.
+        Devolve `TriageDecision` quando é Bounce ou Sem Resposta. Devolve `None` quando existe
+        resposta de terceiro que precisa seguir para análise semântica via connector.
         """
         for message in thread.messages:
             if self._is_delivery_failure_notice(message):
@@ -80,7 +73,7 @@ class ProtocolTriageInspector:
         return None
 
     def _is_delivery_failure_notice(self, message: EmailMessage) -> bool:
-        """Detect RFC 3464 Delivery Status Notifications (DSN) and mailer-daemon bounces."""
+        """Confere se a mensagem veio do subsistema de entrega (mailer-daemon / DSN)."""
         sender_lower = message.sender.lower()
         subject_lower = message.subject.lower()
         content_type_lower = message.content_type.lower()
@@ -102,7 +95,7 @@ class ProtocolTriageInspector:
         return False
 
     def _build_bounce_decision(self, bounce_message: EmailMessage) -> TriageDecision:
-        """Distinguish permanent (5xx) from temporary (4xx) SMTP delivery failures."""
+        """Lê o código SMTP no corpo para separar falha permanente (5xx) de temporária (4xx)."""
         diagnostic_text = f"{bounce_message.subject}\n{bounce_message.body_text}"
 
         match_5xx = self.SMTP_5XX_REGEX.search(diagnostic_text)

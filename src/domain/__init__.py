@@ -1,4 +1,4 @@
-"""Core domain layer: entities, enums, ports, exceptions, and protocol triage inspector."""
+"""Camada de domínio: entidades, enumeradores, exceções, contratos e inspetor de protocolo."""
 
 from src.domain.entities import (
     EmailMessage,
@@ -18,8 +18,8 @@ from src.domain.exceptions import (
     InvalidThreadStateError,
 )
 from src.domain.ports import (
-    MailboxReaderPort,
-    SemanticClassifierPort,
+    MailboxConnectorPort,
+    SemanticConnectorPort,
     TrackingRepositoryPort,
 )
 from src.domain.protocol_inspector import ProtocolTriageInspector
@@ -31,10 +31,10 @@ __all__ = [
     "EmailMessage",
     "EmailThread",
     "InvalidThreadStateError",
-    "MailboxReaderPort",
+    "MailboxConnectorPort",
     "ProtocolTriageInspector",
     "ReplyIntent",
-    "SemanticClassifierPort",
+    "SemanticConnectorPort",
     "ThreadStatus",
     "TrackingRepositoryPort",
     "TrackingRow",

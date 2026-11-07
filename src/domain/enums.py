@@ -1,10 +1,10 @@
-"""Domain taxonomies and state transition matrix (RFC-0001 Section 3.4)."""
+"""Taxonomias de estado e matriz de transição do domínio."""
 
 from enum import StrEnum
 
 
 class ThreadStatus(StrEnum):
-    """Macro operational state of an email thread."""
+    """Estado macro em que uma conversa monitorada existe na planilha."""
 
     NO_REPLY = "SEM_RESPOSTA"
     REPLIED = "RESPONDIDO"
@@ -14,7 +14,7 @@ class ThreadStatus(StrEnum):
 
 
 class ReplyIntent(StrEnum):
-    """Granular semantic intent or protocol failure classification."""
+    """Detalhamento semântico da resposta ou diagnóstico técnico da falha SMTP."""
 
     POSITIVE_CONFIRMED = "POSITIVO_CONFIRMADO"
     QUESTION_OR_RESCHEDULE = "DUVIDA_OU_REAGENDAR"
@@ -26,6 +26,7 @@ class ReplyIntent(StrEnum):
     NOT_APPLICABLE = "N/A"
 
 
+# Quem pode virar o quê: relaciona cada status macro às únicas intenções permitidas para ele.
 ALLOWED_INTENTS_BY_STATUS: dict[ThreadStatus, frozenset[ReplyIntent]] = {
     ThreadStatus.NO_REPLY: frozenset({ReplyIntent.NOT_APPLICABLE}),
     ThreadStatus.REPLIED: frozenset(

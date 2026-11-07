@@ -1,189 +1,204 @@
-# [RFC-0001] Arquitetura do Motor de Triagem e Rastreamento de E-mails Outbound
+# [RFC-0001] Motor de Triagem e Rastreamento de E-mails Outbound
 
 | Metadados | Detalhes |
 | :--- | :--- |
-| **Status** | Aprovado / Em Implementação |
-| **Data** | 2026-11-05 |
-| **Escopo** | Engenharia de Dados, Automação Operacional, Integração LLM |
-| **Integrações Afetadas** | Gmail REST API, Google Sheets API v4, Google Gemini API, GitHub Actions |
+| **Status** | Em Proposta / Implementação |
+| **Data** | 2026-11-07 |
+| **Serviços Externos (Connectors)** | Gmail REST API, Google Gemini API |
+| **Armazenamento (Repository)** | Google Sheets API v4 (aba `Rastreamento`) |
 
 ---
 
-## 1. Contexto e Motivação
+## Contexto e a Parte Difícil
 
-Equipes operacionais que realizam comunicações ativas em lote (*outbound*) — como processos seletivos, prospecção de parcerias, convites institucionais e cobranças de pendências — enfrentam perda de visibilidade logo após o envio inicial. O acompanhamento depende de verificação manual na caixa de saída e entrada do Gmail, gerando três problemas estruturais:
+Equipes operacionais que disparam dezenas ou centenas de e-mails ativos (*outbound*) — processos seletivos, captação de patrocínios, convites de bancas e cobranças operacionais — perdem o controle do acompanhamento logo após o envio.
 
-1. **Alto Custo Operacional de Verificação:** A necessidade de abrir dezenas ou centenas de *threads* individualmente para identificar quem respondeu, quem permanece sem retorno e quais envios falharam.
-2. **Atraso na Reação a Eventos de Protocolo e Redirecionamento:** Falhas de entrega (*bounces* SMTP) e mensagens de ausência (*out of office*) que indicam contatos substitutos ficam misturadas a outros e-mails, atrasando a correção do endereço ou o redirecionamento do contato.
-3. **Ausência de Estado Consolidado:** Não há uma visão única onde múltiplos membros da equipe possam filtrar pendências por tempo de espera, consultar o resumo do retorno e assumir a responsabilidade pelo atendimento sem colisão de trabalho.
+A parte que resiste à automação simples tem três pontos:
+1. **Mistura entre protocolo e linguagem natural:** Parte dos retornos são erros padronizados de servidor (`mailer-daemon` / SMTP `5xx` e `4xx`) ou ausência total de resposta; outra parte são respostas humanas ou avisos de férias (*Out of Office*) indicando outro colega no meio de um parágrafo em texto livre.
+2. **Custo e cota de API externa:** Chamar um modelo de linguagem (LLM) para ler todas as conversas enviadas nos últimos 30 dias a cada execução estoura a cota gratuita da API e reprocessa conversas que não mudaram.
+3. **Concorrência entre robô e humano na mesma tabela:** A equipe trabalha diretamente na planilha atribuindo responsáveis (`Coluna K`) e escrevendo notas (`Coluna L`). Se a automação reescrever a linha inteira ao atualizar o status de um e-mail, ela apaga o trabalho manual da equipe.
 
----
-
-## 2. Objetivos e Não-Objetivos
-
-### 2.1. Objetivos (Goals)
-* **Rastreamento Automatizado e Idempotente:** Sincronizar periodicamente as conversas iniciadas pela conta, processando apenas o diferencial ($\Delta$) de novas mensagens.
-* **Redução de Custos de Inferência (FinOps):** Resolver cenários determinísticos via inspeção de cabeçalhos de protocolo (RFC 5322) antes de acionar modelos de linguagem (LLM).
-* **Classificação Semântica Estruturada:** Categorizar respostas de terceiros em intenções acionáveis e extrair automaticamente endereços de e-mail alternativos quando houver indicação de outro responsável.
-* **Persistência sem Infraestrutura Dedicada:** Utilizar o Google Sheets simultaneamente como interface operacional para a equipe e armazenamento de estado (*state store*), garantindo isolamento entre colunas gerenciadas pelo sistema e colunas editadas por humanos.
-* **Custo Zero de Hospedagem:** Executar todo o ciclo em ambiente *serverless* efêmero via GitHub Actions.
-
-### 2.2. Não-Objetivos (Non-Goals)
-* **Geração ou Disparo Automático de Respostas:** O sistema atua exclusivamente na leitura, triagem e organização da fila. A resposta final ao destinatário permanece sob responsabilidade humana (*Human-in-the-Loop*).
-* **Processamento em Tempo Real Estrito (Sub-segundo):** Não é objetivo deste projeto manter conexões persistentes ou *webhooks* de baixa latência, visto que o SLA operacional de resposta a e-mails é medido em minutos ou horas.
-* **Substituição de Ferramentas de Disparo (Mail Merge):** O sistema monitora e classifica conversas já enviadas, não sendo responsável pelo envio inicial das campanhas em massa.
+Esta RFC propõe a modelagem de dados, os contratos de entrada/saída, os fluxos de execução (feliz, alternativo e de erro) e os *trade-offs* arquiteturais do serviço.
 
 ---
 
-## 3. Desenho da Solução (Detailed Design)
+## 01. Armazenamento e Entidades (O Banco / Estado)
 
-### 3.1. Topologia e Fluxo de Dados
+Seguindo a regra de desenhar o armazenamento antes dos fluxos, o estado do sistema vive na aba **`Rastreamento`** do Google Sheets e é espelhado no código pelas entidades em `src/domain/entities.py` e pelos enumeradores em `src/domain/enums.py`.
 
-A arquitetura é executada como um *job* agendado (*stateless*), dividido em seis etapas sequenciais:
+### 1.1. As Camadas do Serviço (Padrão Base-Service)
+
+| Camada | Arquivo / Pacote | Pergunta que Responde | O que NÃO Faz |
+| :--- | :--- | :--- | :--- |
+| **`domain/`** | `src/domain/entities.py`<br>`src/domain/enums.py`<br>`src/domain/protocol_inspector.py` | Quais entidades e estados existem? O que o protocolo RFC 5322 já resolve dentro de casa? | Chamar rede, ler variável de ambiente ou falar com a planilha. |
+| **`controllers/`** | `src/controllers/triage_controller.py` | Pode ou não pode? A thread mudou? Resolve por regra de protocolo ou liga para o Gemini? | Montar requisição HTTP bruta ou escrever intervalo da planilha. |
+| **`connectors/`** | `src/connectors/gemini_connector.py`<br>`src/connectors/gmail_connector.py` | Como falo com um serviço de fora (com `TIMEOUT` obrigatório) e desembrulho a resposta? | Decidir regra de negócio (`if` de status) ou tocar na planilha. |
+| **`repositories/`** | `src/repositories/sheets_repository.py` | Como busco os cursores salvos e gravo o lote de linhas na planilha? | Decidir qual é o status do e-mail ou chamar o Gemini. |
+
+### 1.2. A Tabela na Planilha (`TrackingRow`) e Suas Chaves
+
+Cada linha na aba `Rastreamento` representa uma única conversa iniciada pela nossa conta (`EmailThread`).
+
+| Col | Campo | Tipo | Papel na Modelagem |
+| :-: | :--- | :--- | :--- |
+| **A** | `Thread_ID` | `STRING (PK)` | **Chave primária da conversa.** Identificador hexadecimal único gerado pelo Gmail. |
+| **B** | `Destinatario` | `STRING (NOT NULL)` | E-mail normalizado para quem nossa equipe enviou a primeira mensagem. |
+| **C** | `Assunto` | `STRING (NOT NULL)` | Assunto original da conversa. |
+| **D** | `Data_Envio` | `DATE (YYYY-MM-DD)` | Data do disparo inicial (`initial_message.sent_at`). |
+| **E** | `Dias_Vacuo` | `INTEGER (>= 0)` | Dias corridos sem resposta humana. **Regra:** zera (`0`) imediatamente quando `Status == RESPONDIDO`. |
+| **F** | `Status` | `ENUM (ThreadStatus)` | Estado macro atual da conversa. |
+| **G** | `Intencao` | `ENUM (ReplyIntent)` | Sub-estado semântico ou código da falha técnica. |
+| **H** | `Contato_Alternativo` | `STRING (NULLABLE)` | Preenchido **obrigatoriamente** quando `Status == PIVOTAR_REDIRECIONADO`. |
+| **I** | `Resumo_Contexto` | `STRING (<= 120 chars)` | Síntese em português do retorno ou do erro SMTP. |
+| **J** | `Link_Direto` | `STRING (URL)` | Link direto para abrir a conversa no navegador. |
+| **K** | `Responsavel` | `STRING (Manual)` | **Zona Humana:** Membro da equipe responsável pelo caso. |
+| **L** | `Notas_Equipe` | `STRING (Manual)` | **Zona Humana:** Anotações livres da operação. |
+| **M** | `Last_Message_ID` | `STRING (Cursor)` | **Chave de idempotência.** Guarda o `message_id` da última mensagem processada naquela thread. |
+
+### 1.3. Estados e Matriz de Transição ("Quem pode virar o quê")
+
+A lista de estados vive em `src/domain/enums.py` e o pareamento obrigatório entre `ThreadStatus` e `ReplyIntent` é barrado em `TriageDecision.__post_init__` (`src/domain/entities.py`):
+
+| Status (`ThreadStatus`) | Intenções Permitidas (`ReplyIntent`) | Quem Decide | Restrição de Domínio (`ContractViolationError`) |
+| :--- | :--- | :--- | :--- |
+| `SEM_RESPOSTA` | `N/A` | `ProtocolTriageInspector` | Só existe se todas as mensagens da thread forem da nossa própria conta. |
+| `INVALIDO_BOUNCE` | `ERRO_PERMANENTE_5XX`<br>`ERRO_TEMPORARIO_4XX` | `ProtocolTriageInspector` | Exige detecção de `mailer-daemon` / DSN `multipart/report`. |
+| `RESPONDIDO` | `POSITIVO_CONFIRMADO`<br>`DUVIDA_OU_REAGENDAR`<br>`RECUSADO` | `GeminiConnector` + `TriageDecision` | Zera o contador `Dias_Vacuo`. |
+| `PIVOTAR_REDIRECIONADO` | `INDICOU_OUTRO_CONTATO` | `GeminiConnector` + `TriageDecision` | **Recusa** a decisão se `alternative_email` vier nulo ou fora do padrão `nome@dominio`. |
+| `AUSENTE_AUTO_REPLY` | `AUSENTE_SEM_SUBSTITUTO` | `GeminiConnector` + `TriageDecision` | Mantém a contagem de `Dias_Vacuo` correndo até o retorno humano. |
+
+---
+
+## 02. Contratos e Schemas (Entrada e Saída dos Connectors)
+
+Embora o sistema rode como um *worker* em lote (sem expor rotas HTTP públicas), ele atua como **cliente HTTP** de três servidores externos (Gmail API, Gemini API e Google Sheets API).
+
+### 2.1. Contrato com o Gemini (`src/connectors/gemini_connector.py`)
+
+* **Prazo máximo (`TIMEOUT_SECONDS`):** `15` segundos (`15000ms` na configuração HTTP do SDK). Se o Gemini não responder em 15 segundos, o connector aborta com `GeminiConnectorError` para não travar a fila.
+* **Modelo configurável:** Recebe `GEMINI_MODEL` via ambiente (`gemini-2.5-flash` por padrão para rodar dentro da cota gratuita de qualquer membro, ou `gemini-2.5-pro` quando executado em conta com faturamento ativo).
+* **Schema de Resposta (`STAGE2_RESPONSE_SCHEMA`):**
+  Repare que os estados `SEM_RESPOSTA` e `INVALIDO_BOUNCE` **não entram no schema enviado ao Gemini**. Quem chega ao connector já passou pelo filtro de protocolo, então o schema impede que a IA devolva um estado que não cabe a ela decidir:
+
+```json
+{
+  "type": "OBJECT",
+  "required": ["status", "intent", "summary_context"],
+  "properties": {
+    "status": {
+      "type": "STRING",
+      "enum": ["RESPONDIDO", "PIVOTAR_REDIRECIONADO", "AUSENTE_AUTO_REPLY"]
+    },
+    "intent": {
+      "type": "STRING",
+      "enum": [
+        "POSITIVO_CONFIRMADO",
+        "DUVIDA_OU_REAGENDAR",
+        "RECUSADO",
+        "INDICOU_OUTRO_CONTATO",
+        "AUSENTE_SEM_SUBSTITUTO"
+      ]
+    },
+    "alternative_email": { "type": "STRING", "nullable": true },
+    "summary_context": { "type": "STRING" }
+  }
+}
+```
+
+### 2.2. Contrato de Escrita Parcial na Planilha (`src/repositories/sheets_repository.py`)
+
+Para respeitar o isolamento das colunas manuais `K` e `L`, o contrato de atualização de uma linha existente `idx` gera sempre **dois intervalos separados** enviados em um único `batch_update`:
+1. `A{idx}:J{idx}` $\rightarrow$ recebe os 10 campos de `TrackingRow.to_automation_columns()`.
+2. `M{idx}` $\rightarrow$ recebe `[[last_message_id]]`.
+
+---
+
+## 03. Fluxos (Feliz, Alternativo e de Erro)
+
+O diagrama abaixo segue as seis regras de fluxo: um verbo por caixa, sequência clara, rótulos `Sim`/`Não` em todos os losangos, demonstração do estado gravado e tratamento explícito dos caminhos de exceção.
 
 ```mermaid
 flowchart TD
-    GHA["GitHub Actions Runner\n(Cron 30min / Execução Manual)"] --> SHEET_STATE["1. Leitura de Estado\nGoogle Sheets (Colunas A e M)"]
-    SHEET_STATE --> GMAIL_FETCH["2. Coleta de Threads\nGmail API (in:sent newer_than:30d)"]
-    GMAIL_FETCH --> DIFF{"3. Verificação de Idempotência\nLast_Message_ID alterado?"}
-    
-    DIFF -- Não --> SKIP["Apenas atualiza contador de dias\n(Zero chamadas de LLM)"]
-    DIFF -- Sim --> STAGE1["4. Estágio 1: Filtro Determinístico\nAnálise de Cabeçalhos RFC 5322 e Padrões SMTP"]
-    
-    STAGE1 -- Apenas remetente próprio --> NO_REPLY["Status: SEM_RESPOSTA\nCálculo de dias sem retorno"]
-    STAGE1 -- Mailer-Daemon / DSN 5xx ou 4xx --> BOUNCE["Status: INVALIDO_BOUNCE\nIdentificação de falha de entrega"]
-    STAGE1 -- Mensagem de terceiro --> STAGE2["5. Estágio 2: Classificação Semântica\nGemini 2.5 Flash (Saída Estruturada)"]
-    
-    STAGE2 --> LLM_PARSE["Validação de Contrato de Dados\nStatus, Intenção, Contato Alternativo e Resumo"]
-    
-    SKIP --> BATCH_WRITE
-    NO_REPLY --> BATCH_WRITE["6. Persistência em Lote\nAtualização parcial no Google Sheets (Colunas A:J e M)"]
-    BOUNCE --> BATCH_WRITE
-    LLM_PARSE --> BATCH_WRITE
+    START(["Início do Ciclo (Cron 30min)"]) --> LOAD_CURSORS["Ler cursores (Colunas A e M) no SheetsRepository"]
+    LOAD_CURSORS --> FETCH_THREADS["Buscar threads enviadas (30d) no GmailConnector"]
+    FETCH_THREADS --> LOOP_CHECK{"Last_Message_ID mudou?"}
+
+    LOOP_CHECK -- "Não (Idempotente)" --> SKIP_THREAD["Ignorar thread (0 chamadas extras)"]
+    LOOP_CHECK -- "Sim (Mensagem nova)" --> INSPECT_BOUNCE{"É aviso de Bounce SMTP?"}
+
+    INSPECT_BOUNCE -- "Sim (Caminho Alternativo 1)" --> SET_BOUNCE["Definir status: INVALIDO_BOUNCE\n(5xx Permanente ou 4xx Temporário)"]
+    INSPECT_BOUNCE -- "Não" --> HAS_EXTERNAL{"Tem mensagem de terceiro?"}
+
+    HAS_EXTERNAL -- "Não (Caminho Alternativo 2)" --> SET_NOREPLY["Definir status: SEM_RESPOSTA\nCalcular Dias_Vacuo"]
+    HAS_EXTERNAL -- "Sim (Caminho Feliz)" --> CALL_GEMINI["Chamar GeminiConnector (timeout=15s)"]
+
+    CALL_GEMINI --> GEMINI_OK{"Respondeu JSON no prazo?"}
+    GEMINI_OK -- "Não (Erro 5xx / Timeout)" --> ERR_SKIP["Registrar erro e manter cursor antigo\n(Reprocessa no próximo ciclo)"]
+    GEMINI_OK -- "Sim" --> VALIDATE_CONTRACT{"Passou na matriz TriageDecision?"}
+
+    VALIDATE_CONTRACT -- "Não (Erro de Contrato)" --> ERR_SKIP
+    VALIDATE_CONTRACT -- "Sim" --> SET_SEMANTIC["Definir status: RESPONDIDO,\nPIVOTAR_REDIRECIONADO ou AUSENTE_AUTO_REPLY"]
+
+    SET_BOUNCE --> QUEUE_ROW["Montar TrackingRow (Colunas A:J e M)"]
+    SET_NOREPLY --> QUEUE_ROW
+    SET_SEMANTIC --> QUEUE_ROW
+
+    QUEUE_ROW --> BATCH_COMMIT["Gravar lote único via batch_update no SheetsRepository"]
+    SKIP_THREAD --> END_CYCLE(["Fim do Ciclo"])
+    ERR_SKIP --> BATCH_COMMIT
+    BATCH_COMMIT --> END_CYCLE
 ```
 
-### 3.2. Controle de Estado e Sincronização Incremental (Delta Sync)
+### Detalhamento dos Caminhos de Erro (O que acontece quando dá errado)
 
-Como o ambiente de execução no GitHub Actions é efêmero, o estado de processamento é persistido na própria planilha operacional através de duas chaves:
-* `Thread_ID` (Coluna `A`): Chave primária que identifica a conversa no Gmail.
-* `Last_Message_ID` (Coluna `M`): Cursor que armazena o ID da última mensagem inspecionada naquela conversa.
-
-Durante a execução, o serviço carrega em memória o mapa `{Thread_ID: Last_Message_ID}` da planilha. Ao listar as *threads* enviadas nos últimos 30 dias via Gmail API, o sistema verifica se o ID da última mensagem da *thread* coincide com o cursor salvo. Caso coincida, o conteúdo da conversa não sofreu alterações desde a última varredura — o sistema evita o *parse* completo e qualquer chamada ao LLM, recalculando apenas a contagem de dias em aberto caso a conversa siga com status `SEM_RESPOSTA`.
-
-### 3.3. Pipeline de Classificação em Dois Estágios
-
-Para evitar o uso de inferência probabilística em regras de protocolo, as conversas com novas interações passam por um funil de dois estágios:
-
-1. **Estágio 1 — Filtro Determinístico de Protocolo (Local):**
-   * **Detecção de Falhas de Entrega (*Bounce*):** Inspeciona os cabeçalhos `From`, `Subject` e `Content-Type` (`multipart/report`, `report-type=delivery-status`) em busca de remetentes de subsistema de correio (`mailer-daemon`, `postmaster`). Aplica expressões regulares no corpo técnico da notificação para distinguir erros permanentes (`5xx` — *Hard Bounce*) de falhas temporárias (`4xx` — *Soft Bounce*).
-   * **Detecção de Ausência de Interação:** Filtra a lista de mensagens da *thread* comparando o remetente com o endereço da própria conta. Se todas as mensagens pertencerem ao remetente original (incluindo *follow-ups* enviados pela própria equipe), a conversa é classificada imediatamente como `SEM_RESPOSTA`.
-
-2. **Estágio 2 — Classificador Semântico (Google Gemini 2.5 Flash):**
-   * Acionado exclusivamente quando a *thread* contém mensagens de terceiros que não são erros de entrega.
-   * O histórico cronológico da conversa é submetido ao modelo com temperatura zero (`0.0`) e restrição de esquema (*Constrained Decoding* / `response_schema`), obrigando o retorno de um payload JSON aderente ao contrato de dados da aplicação.
-
-### 3.4. Contrato de Dados e Taxonomia
-
-Toda análise concluída (seja pelo Estágio 1 ou pelo Estágio 2) produz uma estrutura padronizada composta por quatro atributos antes da persistência:
-
-| Atributo | Tipo | Obrigatoriedade | Descrição |
-| :--- | :--- | :---: | :--- |
-| `status` | `Enum (ThreadStatus)` | Sim | Estado macro da conversa (`SEM_RESPOSTA`, `RESPONDIDO`, `PIVOTAR_REDIRECIONADO`, `AUSENTE_AUTO_REPLY`, `INVALIDO_BOUNCE`). |
-| `intent` | `Enum (ReplyIntent)` | Sim | Detalhamento da resposta ou falha (descrito na tabela abaixo). |
-| `alternative_email` | `String ( Nullable )` | Não | Endereço de e-mail extraído quando há indicação de novo contato ou substituto de férias. |
-| `summary_context` | `String (<= 120 chars)` | Sim | Síntese objetiva em português resumindo a resposta ou o erro técnico. |
-
-#### Matriz de Transição: Status vs. Intenção
-
-| Status Macro (`ThreadStatus`) | Intenção Específica (`ReplyIntent`) | Origem da Decisão | Critério de Atribuição |
-| :--- | :--- | :---: | :--- |
-| `RESPONDIDO` | `POSITIVO_CONFIRMADO` | Estágio 2 (LLM) | Aceite de convite, confirmação de entrevista ou interesse explícito. |
-| `RESPONDIDO` | `DUVIDA_OU_REAGENDAR` | Estágio 2 (LLM) | Pedido de informações adicionais, proposta de novo horário ou dúvidas. |
-| `RESPONDIDO` | `RECUSADO` | Estágio 2 (LLM) | Declínio formal do convite, desistência ou falta de interesse/orçamento. |
-| `PIVOTAR_REDIRECIONADO` | `INDICOU_OUTRO_CONTATO` | Estágio 2 (LLM) | Resposta humana ou aviso de ausência indicando terceiro para contato. |
-| `AUSENTE_AUTO_REPLY` | `AUSENTE_SEM_SUBSTITUTO` | Estágio 2 (LLM) | Resposta automática de férias/licença sem indicação de substituto. |
-| `INVALIDO_BOUNCE` | `ERRO_PERMANENTE_5XX` | Estágio 1 (Regra) | Código SMTP `5xx` (conta inexistente ou domínio inválido). |
-| `INVALIDO_BOUNCE` | `ERRO_TEMPORARIO_4XX` | Estágio 1 (Regra) | Código SMTP `4xx` (caixa cheia ou servidor temporariamente indisponível). |
-| `SEM_RESPOSTA` | `N/A` | Estágio 1 (Regra) | Nenhuma mensagem externa recebida desde o disparo. |
-
-### 3.5. Isolamento de Concorrência na Escrita (Google Sheets)
-
-Para permitir que a equipe utilize a planilha simultaneamente sem risco de perda de dados manuais, o layout de colunas é particionado em zonas de escrita:
-
-* **Zona de Automação (Colunas `A` a `J` e Coluna `M`):** Atualizada pelo sistema a cada ciclo.
-* **Zona Manual da Equipe (Colunas `K` e `L` — `Responsavel` e `Notas_Equipe`):** Exclusiva para edição humana.
-
-Na etapa de persistência, o cliente de planilha não sobrescreve a linha inteira (`A:M`). Para cada registro atualizado, são geradas duas instruções de escrita matricial independentes (`A{linha}:J{linha}` e `M{linha}`), agrupadas em uma única chamada `batch_update`. Dessa forma, as células nas colunas `K` e `L` jamais são tocadas pela automação.
+1. **O Gemini demora mais de 15s ou cai (`GeminiConnectorError`):**
+   * O `GeminiConnector` corta a espera no limite de `TIMEOUT_SECONDS = 15`.
+   * O controller captura a falha daquela thread específica, registra no log e **não inclui** aquela thread no pacote de atualização da planilha.
+   * Como o `Last_Message_ID` na coluna `M` permanece com o valor antigo, na execução seguinte (30 minutos depois) a thread entra novamente no fluxo de forma automática.
+2. **O Gemini devolve `PIVOTAR_REDIRECIONADO`, mas `alternative_email` vem vazio (`ContractViolationError`):**
+   * A entidade `TriageDecision` barra a criação do objeto antes de chegar ao repository. A linha não é corrompida na planilha.
+3. **O resumo do Gemini passa de 120 caracteres (ex.: 130 caracteres):**
+   * Em vez de derrubar a classificação, `TriageDecision.from_raw_dict` apara o texto em `117 caracteres + "..."` e segue o fluxo normal.
 
 ---
 
-## 4. Alternativas Consideradas e Trade-offs
+## 04. Decisões e Trade-offs (O que não escolhemos e por quê)
 
-### 4.1. Ingestão: Polling Incremental (GitHub Actions) vs. Event-Driven (GCP Pub/Sub + Webhooks)
-* **Alternativa Descartada (GCP Pub/Sub):** Configurar `users.watch` na Gmail API enviando eventos para um tópico Cloud Pub/Sub consumido por um serviço Cloud Run/Lambda.
-* **Por que foi descartada:** Embora entregue latência de segundos, exige infraestrutura *cloud* provisionada, configuração complexa de permissões IAM, faturamento ativo no GCP e uma rotina paralela para renovar o registro do `users.watch` a cada 7 dias (limite da API do Gmail). O *polling* a cada 30 minutos no GitHub Actions atende integralmente à necessidade de negócio com custo zero e manutenção mínima.
+### 4.1. Triagem em Dois Estágios vs. Enviar 100% das Threads ao LLM vs. Não Fazer Nada
 
-### 4.2. Triagem: Funil Híbrido (Regras + LLM) vs. Processamento 100% LLM
-* **Alternativa Descartada (100% LLM):** Enviar o conteúdo de todas as *threads* diretamente para o Gemini classificar, inclusive conversas sem resposta ou erros de servidor.
-* **Por que foi descartada:** Em lotes de comunicação ativa, a maioria das conversas permanece sem resposta nos primeiros dias. Submeter esses registros ao LLM consumiria cota de API desnecessariamente, aumentaria a latência total do *job* e introduziria risco de alucinação em diagnósticos puramente determinísticos (como códigos SMTP `550`).
+* **Opção Escolhida (Inspetor de Protocolo RFC 5322 + Connector Gemini):**
+  * **Ganha:** Resolve 100% dos casos de `SEM_RESPOSTA` e `INVALIDO_BOUNCE` em menos de 1ms localmente, sem gastar um único token de IA. O Gemini só é chamado quando realmente existe texto escrito por outra pessoa.
+  * **Paga:** Mantemos duas lógicas de classificação no projeto (`src/domain/protocol_inspector.py` para cabeçalhos técnicos e `src/connectors/gemini_connector.py` para texto livre).
+* **Alternativa Descartada A — Enviar 100% das threads para o Gemini:**
+  * **O preço real:** Em uma campanha de 200 e-mails enviados onde 160 ainda não responderam, faríamos 160 chamadas inúteis ao LLM apenas para ele dizer que só existe 1 mensagem na thread.
+  * **Quando ela ganharia:** Se o volume de envios fosse minúsculo (ex.: menos de 5 e-mails por dia) e não houvesse restrição de cota gratuita por minuto na API.
+* **Alternativa Descartada B — Não fazer nada (Triagem manual na caixa de enviados):**
+  * **O preço real:** Zero código para manter, mas consome de 1 a 2 horas diárias da equipe abrindo thread por thread no Gmail e causa perda de *timing* em respostas comerciais e processos seletivos.
+  * **Quando ela ganharia:** Quando a equipe dispara menos de 10 e-mails por mês.
 
-### 4.3. Armazenamento e UI: Google Sheets vs. Banco Relacional + Dashboard Web
-* **Alternativa Descartada (PostgreSQL + Frontend Customizado):** Construir uma aplicação web própria com banco de dados dedicado para exibir a fila de triagem.
-* **Por que foi descartada:** Criaria sobrecarga de desenvolvimento e sustentação de um sistema de CRUD/autenticação apenas para replicar funcionalidades nativas de uma planilha compartilhada (filtros por coluna, formatação condicional, edição colaborativa e facilidade de acesso por equipes não técnicas).
+### 4.2. Polling Incremental (GitHub Actions) vs. Webhook em Tempo Real (GCP Pub/Sub)
 
-### 4.4. Estilo Arquitetural: Monólito Modular (Ports & Adapters) vs. Microsserviços Distribuídos
-* **Alternativa Descartada (Microsserviços):** Separar a ingestão do Gmail, o motor de classificação de IA e o gravador de estado em serviços independentes comunicando-se via filas de mensagens ou chamadas HTTP.
-* **Por que foi descartada:** O processamento de triagem é intrinsecamente sequencial e executado em janelas de lote (*batch*). Distribuir esse fluxo em microsserviços geraria um *monólito distribuído*, introduzindo latência de rede desnecessária, custos de orquestração de múltiplos *containers* e complexidade de rastreamento de falhas parciais.
-* **Abordagem Adotada:** Unidade única de implantação (*Single Deployable Unit*) estruturada internamente sob **Arquitetura Hexagonal Simplificada (Ports & Adapters)**. O núcleo de domínio (contratos de dados e heurísticas determinísticas) permanece isolado das integrações externas (Gmail, Gemini e Google Sheets), permitindo substituir qualquer provedor externo (ex.: migrar do Google Sheets para um banco relacional ou CRM no futuro) alterando apenas a camada de adaptadores.
+* **Opção Escolhida (Polling a cada 30 min com cursor `Last_Message_ID`):**
+  * **Ganha:** Custo R$ 0 de servidor, roda em container efêmero do GitHub Actions e qualquer membro da equipe clona e configura apenas preenchendo 4 *Secrets*.
+  * **Paga:** Uma resposta recebida às 14h01 só aparece na planilha às 14h30.
+* **Alternativa Descartada — `users.watch` da Gmail API + Cloud Pub/Sub + Servidor HTTP 24/7:**
+  * **O preço real:** Exige servidor web sempre ligado com HTTPS público, configuração de IAM no Google Cloud, cobrança mensal de infraestrutura e um job extra para renovar o `users.watch` a cada 7 dias.
+  * **Quando ela ganharia:** Em um sistema de atendimento de suporte crítico (SLA de resposta abaixo de 2 minutos) ou *chat* transacional em tempo real.
 
----
+### 4.3. Google Sheets como Estado e UI vs. Banco PostgreSQL + Frontend Próprio
 
-## 5. Requisitos Não-Funcionais e Impacto Operacional
-
-### 5.1. Cotas de API, Rate Limiting e Performance
-* **Google Sheets API:** Possui limite rígido de requisições de escrita por minuto por usuário. Para evitar erros `HTTP 429 (Too Many Requests)`, é proibido realizar chamadas `update_cell` dentro de laços de repetição. Toda a leitura inicial é feita em lote e toda a gravação ocorre em uma única requisição `batch_update` ao final do processamento.
-* **Gemini API:** Graças ao filtro de idempotência (`Last_Message_ID`) e ao Estágio 1, o volume de chamadas ao Gemini por execução restringe-se apenas às *threads* que receberam respostas humanas ou avisos de ausência nos últimos 30 minutos, mantendo o consumo dentro da faixa gratuita ou de baixo custo da API.
-
-### 5.2. Segurança e Gestão de Credenciais
-* **Princípio do Menor Privilégio:** O acesso à Gmail API solicita escopo estrito de leitura (`gmail.readonly`), garantindo que a credencial não tenha permissão técnica para enviar, alterar ou excluir e-mails da conta.
-* **Armazenamento de Segredos:** Chaves privadas (`GOOGLE_SERVICE_ACCOUNT_JSON`, `GMAIL_OAUTH_TOKEN_JSON` e `GEMINI_API_KEY`) nunca são versionadas no repositório; são injetadas em tempo de execução exclusivamente via *GitHub Encrypted Secrets*.
-* **Privacidade de Dados:** Os corpos dos e-mails não são armazenados em bancos de dados intermediários nem registrados em *logs* de console do GitHub Actions; apenas o resumo executivo (máximo de 120 caracteres) e os metadados de triagem são persistidos na planilha privada da equipe.
-
-### 5.3. Resiliência e Tratamento de Falhas
-* **Falhas Parciais de Inferência:** Caso uma chamada específica ao Gemini falhe por instabilidade transitória de rede, o cursor `Last_Message_ID` daquela *thread* não é atualizado na planilha, garantindo que a conversa seja reprocessada automaticamente no ciclo seguinte (30 minutos depois) sem perda de dados.
-* **Prevenção de Expiração de Token OAuth:** O aplicativo OAuth no Google Cloud Console deve ser configurado com status de publicação **"In Production"** para evitar a revogação automática de *refresh tokens* a cada 7 dias (comportamento padrão do modo *Testing*).
+* **Opção Escolhida (Google Sheets com zonas de colunas isoladas `A:J` + `M` vs `K:L`):**
+  * **Ganha:** A equipe já trabalha diariamente no Google Sheets; filtros, ordenação e links clicáveis já estão prontos sem precisar construir nem hospedar um frontend React e um banco Postgres.
+  * **Paga:** Não temos transações ACID nem *foreign keys* nativas de banco relacional, exigindo que o código garanta a idempotência via `Last_Message_ID` e faça escrita cirúrgica em lote (`batch_update`) para não sobrescrever as colunas `K` e `L` nem tomar erro `HTTP 429` de limite de requisições.
+* **Alternativa Descartada — PostgreSQL + API FastAPI + Dashboard Web:**
+  * **Quando ela ganharia:** Se o sistema precisasse cruzar milhares de relacionamentos N:N entre campanhas, controlar permissões de acesso por linha ou auditar histórico de eventos (`status_event`) para múltiplos clientes externos (*multi-tenant*).
 
 ---
 
-## 6. Arquitetura Interna de Componentes e Estratégia de Testes
+## 05. O que o Autor Precisa que o Time Decida
 
-### 6.1. Organização em Camadas (Ports & Adapters)
-Para garantir baixo acoplamento e alta testabilidade dentro de uma única unidade de execução, o código-fonte é dividido em três camadas com dependências unidirecionais (Adaptadores e Pipeline dependem do Domínio; o Domínio não depende de pacotes externos de I/O):
-
-```text
-outbound-email-tracker/
-├── .github/workflows/             # Definição do runner serverless (GitHub Actions)
-├── docs/
-│   └── ARCHITECTURE.md            # RFC-0001: Especificação arquitetural e decisões de projeto
-├── src/
-│   ├── config.py                  # Carregamento e validação estrita de variáveis de ambiente
-│   ├── domain/                    # NÚCLEO DE DOMÍNIO (Zero dependências externas de rede/I/O)
-│   │   ├── enums.py               # Taxonomias (ThreadStatus, ReplyIntent) e Matriz de Transição
-│   │   ├── entities.py            # Entidades ricas (EmailThread, EmailMessage, TriageDecision)
-│   │   ├── exceptions.py          # Exceções de invariantes de negócio e violação de contrato
-│   │   ├── ports.py               # Contratos abstratos (Interfaces) exigidos dos adaptadores
-│   │   └── protocol_inspector.py  # ProtocolTriageInspector (inspeção RFC 5322, DSN e SMTP)
-│   ├── adapters/                  # ADAPTADORES DE INFRAESTRUTURA (Implementação das Ports)
-│   │   ├── gmail_adapter.py       # Autenticação OAuth2, busca de threads e parsing MIME
-│   │   ├── gemini_adapter.py      # Classificador Semântico (Gemini 2.5 Flash)
-│   │   └── sheets_adapter.py      # Leitura de cursores e escrita parcial em lote (batch_update)
-│   └── pipeline/                  # CAMADA DE APLICAÇÃO (Orquestração de Casos de Uso)
-│       └── sync_service.py        # Coordena Delta Sync -> Protocol Inspector -> Semantic -> Sheets
-└── tests/                         # Suíte de testes unitários isolados por camada
-```
-
-### 6.2. Garantia de Qualidade (Testes Offline)
-A validação do sistema no pipeline de CI não depende de conexão com a Gmail API ou Gemini API, baseando-se em três suítes de testes unitários com *fixtures* locais:
-1. **Testes de Protocolo (Estágio 1):** Verificam se *threads* contendo apenas mensagens do próprio remetente resultam em `SEM_RESPOSTA` e se notificações `mailer-daemon` são corretamente separadas entre códigos `5xx` e `4xx`.
-2. **Testes de Contrato Semântico (Estágio 2):** Simulam o retorno do SDK `google-genai` para assegurar a deserialização estrita dos enumeradores e a extração de `alternative_email`.
-3. **Testes de Integridade de Escrita:** Validam a função construtora de payloads do Google Sheets para garantir que nenhum intervalo gerado inclua as colunas manuais `K` e `L`.
+| A Pergunta | O que o Autor Defende |
+| :--- | :--- |
+| **Qual modelo deixar como padrão no GitHub Actions: `gemini-2.5-flash` ou `gemini-2.5-pro`?** | Deixar `gemini-2.5-flash` como padrão no repositório (permite que qualquer membro rode na cota gratuita sem cartão) e parametrizar via variável `GEMINI_MODEL` para usar `gemini-2.5-pro` quando rodarmos com chave paga. |
+| **Quando um aviso de férias (`AUSENTE_AUTO_REPLY`) chega sem substituto, zeramos o `Dias_Vacuo` ou mantemos contando?** | **Manter contando.** A pessoa ainda não deu retorno sobre o assunto; se zerarmos, a linha sai do filtro de pendências da equipe. |
+| **Qual janela de busca usar na Gmail API (`GMAIL_LOOKBACK_DAYS`)?** | **30 dias.** Conversas com mais de 30 dias sem interação já encerraram o ciclo operacional de *follow-up*, e limitar a janela evita paginar milhares de e-mails antigos. |

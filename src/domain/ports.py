@@ -1,46 +1,37 @@
-"""
-Architectural Ports (Interfaces) for Hexagonal Architecture (RFC-0001 Section 6.1).
+"""Contratos internos (Protocols) para desacoplar o controller dos connectors e do repository."""
 
-Defines the contracts that external infrastructure adapters (Gmail, Gemini, Google Sheets)
-must implement to interact with the core domain and application pipeline.
-"""
+from typing import Any, Protocol
 
-from typing import Protocol
-
-from src.domain.entities import EmailThread, TrackingRow, TriageDecision
+from src.domain.entities import EmailThread, TrackingRow
 
 
-class MailboxReaderPort(Protocol):
-    """Port for fetching outbound email threads from an email provider (e.g., Gmail API)."""
+class MailboxConnectorPort(Protocol):
+    """Contrato do connector que busca conversas enviadas no provedor de e-mail (Gmail API)."""
 
     def get_authenticated_address(self) -> str:
-        """Return the email address of the authenticated outbound mailbox."""
+        """Devolve o e-mail da conta autenticada."""
         ...
 
     def fetch_recent_outbound_threads(self, lookback_days: int) -> list[EmailThread]:
-        """Fetch outbound threads initiated within the specified lookback window."""
+        """Busca as conversas iniciadas pela conta dentro da janela de dias informada."""
         ...
 
 
-class SemanticClassifierPort(Protocol):
-    """Port for semantic natural-language analysis of third-party email replies (e.g., Gemini)."""
+class SemanticConnectorPort(Protocol):
+    """Contrato do connector que consulta o serviço externo de IA (Gemini API)."""
 
-    def classify_thread(
-        self,
-        thread: EmailThread,
-        outbound_account_email: str,
-    ) -> TriageDecision:
-        """Analyze conversation history and return a validated TriageDecision."""
+    def analyze_transcript(self, transcript: str) -> dict[str, Any]:
+        """Envia a transcrição da conversa e devolve o JSON desembrulhado em dict."""
         ...
 
 
 class TrackingRepositoryPort(Protocol):
-    """Port for reading state cursors and persisting triage rows (e.g., Google Sheets)."""
+    """Contrato do repository que lê cursores e grava as linhas de triagem no Google Sheets."""
 
     def load_processed_cursors(self) -> dict[str, str]:
-        """Return a mapping of {thread_id: last_message_id} currently stored in the state store."""
+        """Devolve o mapa {thread_id: last_message_id} salvo atualmente na planilha."""
         ...
 
     def save_tracking_rows(self, rows: list[TrackingRow]) -> None:
-        """Persist new and updated tracking rows in batch while preserving manual team columns."""
+        """Grava as linhas novas e atualizadas em lote sem tocar nas colunas manuais K e L."""
         ...
